@@ -1,0 +1,159 @@
+# databricks.yml — standalone Catastrophe Command demo
+bundle:
+  name: caspers-catastrophe
+
+variables:
+  catalog:
+    description: "UC catalog for this bundle/target"
+    default: devconnect
+
+workspace:
+  root_path: /Workspace/Users/${workspace.current_user.userName}/caspers-catastrophe-demo
+  file_path: ${workspace.root_path}
+
+sync:
+  include:
+    - ./*
+  exclude:
+    - .git/**
+    - .DS_Store
+    - .claude/**
+    - .databricks/**
+    - .venv/**
+    - .bundle/**
+    - __pycache__/**
+    - "*.pyc"
+    - apps/**/.databricks/**
+    - apps/**/node_modules/**
+    - apps/**/dist/**
+    # Generated at runtime by stages/catastrophe_command.ipynb
+    - apps/catastrophe-command/app.yaml
+
+scripts:
+  cleanup:
+    # Cleanup is a bundle SCRIPT (not a job task). Catalog override:
+    #   BUNDLE_VAR_catalog=mycatalog databricks bundle run cleanup
+    # `--params CATALOG=...` is ignored by scripts.
+    content: |
+      set -eo pipefail
+
+      TARGET_FLAG=""
+      if [ -n "$DATABRICKS_BUNDLE_TARGET" ]; then
+        TARGET_FLAG="-t $DATABRICKS_BUNDLE_TARGET"
+      fi
+
+      VAR_FLAG=""
+      if [ -n "$BUNDLE_VAR_catalog" ]; then
+        VAR_FLAG="--var catalog=$BUNDLE_VAR_catalog"
+      fi
+
+      RESOLVED_JSON="$(databricks bundle validate $TARGET_FLAG $VAR_FLAG --output json)"
+
+      FILE_PATH="$(printf '%s' "$RESOLVED_JSON" | jq -r '.workspace.file_path // (.workspace.root_path + "/src")')"
+      CATALOG="$(printf '%s' "$RESOLVED_JSON" | jq -r '.variables.catalog.value // .variables.catalog.default')"
+
+      echo "Cleaning up catalog: $CATALOG"
+      echo "  (override with: BUNDLE_VAR_catalog=<name> databricks bundle run cleanup)"
+
+      mkdir -p .bundle
+      cat > .bundle/submit.json <<JSON
+      {
+        "run_name": "caspers-catastrophe: cleanup (ephemeral)",
+        "tasks": [
+          {
+            "task_key": "destroy",
+            "notebook_task": {
+              "notebook_path": "$FILE_PATH/destroy",
+              "source": "WORKSPACE",
+              "base_parameters": { "CATALOG": "$CATALOG" }
+            }
+          }
+        ]
+      }
+      JSON
+
+      databricks jobs submit --json @.bundle/submit.json
+
+targets:
+  default:
+    default: true
+    variables:
+      catalog:
+        default: devconnect
+    resources:
+      sql_warehouses:
+        caspers_devconnect_ops_warehouse:
+          name: ${var.catalog}-devconnect-ops
+          cluster_size: 2X-Small
+          min_num_clusters: 1
+          max_num_clusters: 1
+          auto_stop_mins: 60
+          enable_serverless_compute: true
+          warehouse_type: PRO
+      dashboards:
+        catastrophe_command_center:
+          display_name: "Delivery Catastrophe Command Center (${var.catalog})"
+          file_path: ./resources/dashboards/catastrophe_command_center.lvdash.json
+          warehouse_id: ${resources.sql_warehouses.caspers_devconnect_ops_warehouse.id}
+          dataset_catalog: ${var.catalog}
+      jobs:
+        caspers:
+          name: "Catastrophe Command Initializer"
+          queue:
+            enabled: true
+          performance_target: PERFORMANCE_OPTIMIZED
+
+          parameters:
+            - name: CATALOG
+              default: ${var.catalog}
+            - name: SIMULATOR_SCHEMA
+              default: metadata
+            - name: OPS_WAREHOUSE_NAME
+              default: ${var.catalog}-devconnect-ops
+            - name: AI_GATEWAY_ENDPOINT_NAME
+              default: ""
+              # Empty => {catalog}.default.command-agent, created by Catastrophe_Command.
+            - name: AGENT_LLM_FALLBACK
+              default: ""
+            - name: HISTORY_TARGET_ORDERS
+              default: "2000000"
+            - name: HISTORY_DAYS
+              default: "90"
+
+          tasks:
+            - task_key: Canonical_Data
+              notebook_task:
+                notebook_path: ${workspace.root_path}/stages/canonical_data
+
+            - task_key: Lakebase_Project
+              depends_on:
+                - task_key: Canonical_Data
+              notebook_task:
+                notebook_path: ${workspace.root_path}/stages/lakebase_project
+
+            - task_key: Catastrophe_History
+              depends_on:
+                - task_key: Canonical_Data
+              notebook_task:
+                notebook_path: ${workspace.root_path}/stages/catastrophe_history
+
+            - task_key: Catastrophe_Hist_Lakebase
+              depends_on:
+                - task_key: Catastrophe_History
+                - task_key: Lakebase_Project
+              notebook_task:
+                notebook_path: ${workspace.root_path}/stages/catastrophe_hist_lakebase
+
+            - task_key: Catastrophe_Command
+              depends_on:
+                - task_key: Lakebase_Project
+                - task_key: Catastrophe_History
+                - task_key: Catastrophe_Hist_Lakebase
+              notebook_task:
+                notebook_path: ${workspace.root_path}/stages/catastrophe_command
+
+            - task_key: Catalog_Commits
+              depends_on:
+                - task_key: Catastrophe_Command
+              notebook_task:
+                notebook_path: ${workspace.root_path}/stages/catalog_commits

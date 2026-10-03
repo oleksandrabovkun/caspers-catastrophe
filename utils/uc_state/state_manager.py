@@ -1,0 +1,624 @@
+"""
+UC-State: Unity Catalog-based state management utility
+Manages Databricks resource state using Unity Catalog tables.
+"""
+
+import json
+import uuid
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Union
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class UCState:
+    """Unity Catalog-based state management for Databricks resources."""
+
+    def __init__(self, catalog: str, schema: str = "_internal_state", table: str = "resources"):
+        """
+        Initialize UC-State manager.
+
+        Args:
+            catalog: The catalog name to store state in
+            schema: Schema name (default: _internal_state)
+            table: Table name (default: resources)
+        """
+        self.catalog = catalog
+        self.schema = schema
+        self.table = table
+        self.full_table_name = f"{catalog}.{schema}.{table}"
+        # Lazy-import the SDK so `from uc_state import add` doesn't pay the
+        # WorkspaceClient discovery cost in notebooks that only import the
+        # module (e.g. for type hints or convenience functions) without ever
+        # constructing a UCState.
+        from databricks.sdk import WorkspaceClient
+        self.w = WorkspaceClient()
+
+        self._ensure_catalog_schema_table()
+    
+    def _ensure_catalog_schema_table(self):
+        """Ensure the catalog, schema and table exist."""
+        try:
+            # Check if catalog exists
+            try:
+                self.w.catalogs.get(self.catalog)
+            except Exception:
+                logger.warning(f"Catalog {self.catalog} may not exist or not accessible")
+                
+            # Create schema if it doesn't exist
+            try:
+                self.w.schemas.get(f"{self.catalog}.{self.schema}")
+            except Exception:
+                try:
+                    self.w.schemas.create(
+                        name=self.schema,
+                        catalog_name=self.catalog,
+                        comment="UC-State schema for resource management"
+                    )
+                    logger.info(f"Created schema {self.catalog}.{self.schema}")
+                except Exception as e:
+                    logger.warning(f"Could not create schema: {e}")
+            
+            # Create table if it doesn't exist
+            self._create_table_if_not_exists()
+            
+        except Exception as e:
+            logger.error(f"Error ensuring catalog/schema/table: {e}")
+            raise
+    
+    def _create_table_if_not_exists(self):
+        """Create the state table if it doesn't exist."""
+        create_table_sql = f"""
+        CREATE TABLE IF NOT EXISTS {self.full_table_name} (
+            internal_id STRING NOT NULL,
+            resource_type STRING NOT NULL,
+            resource_data STRING NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+            PRIMARY KEY (internal_id)
+        ) USING DELTA
+        TBLPROPERTIES('delta.feature.allowColumnDefaults' = 'supported')
+        """
+        
+        try:
+            from pyspark.sql import SparkSession
+            spark = SparkSession.getActiveSession()
+            if spark:
+                spark.sql(create_table_sql)
+                logger.info(f"Ensured table {self.full_table_name} exists")
+            else:
+                logger.warning("No active Spark session found, cannot create table")
+        except Exception as e:
+            logger.error(f"Error creating table: {e}")
+            raise
+    
+    def add(self, resource_type: str, resource_obj: Any) -> str:
+        """
+        Add a resource to state.
+
+        Args:
+            resource_type: Type of resource (experiments, jobs, pipelines, apps, databaseinstances, endpoints, catalogs, databasecatalogs, warehouses, genie_spaces, vector_search_endpoints, vector_search_indexes)
+            resource_obj: The API return object from Databricks SDK or a dict with resource metadata
+            
+        Returns:
+            internal_id: Generated UUID for this resource
+        """
+        internal_id = str(uuid.uuid4())
+        
+        # Convert resource object to JSON string
+        if hasattr(resource_obj, 'as_dict'):
+            resource_data = json.dumps(resource_obj.as_dict())
+        elif hasattr(resource_obj, '__dict__'):
+            # Handle objects without as_dict() method
+            resource_data = json.dumps(resource_obj.__dict__, default=str)
+        else:
+            # Handle primitive types or dictionaries
+            resource_data = json.dumps(resource_obj, default=str)
+
+        # SQL-escape single quotes in the JSON payload before string interpolation.
+        # JSON does not escape `'`, so descriptions like "Casper's Ops Dashboard"
+        # would break the f-string-built INSERT below with PARSE_SYNTAX_ERROR
+        # ("extra input 'Ops'" etc.).  Doubling the apostrophe is the SQL-standard
+        # escape and is safe to apply unconditionally.
+        resource_data = resource_data.replace("'", "''")
+
+        insert_sql = f"""
+        INSERT INTO {self.full_table_name} 
+        (internal_id, resource_type, resource_data, created_at)
+        VALUES ('{internal_id}', '{resource_type}', '{resource_data}', CURRENT_TIMESTAMP())
+        """
+        
+        try:
+            from pyspark.sql import SparkSession
+            spark = SparkSession.getActiveSession()
+            if spark:
+                spark.sql(insert_sql)
+                logger.info(f"Added {resource_type} resource with ID {internal_id}")
+                return internal_id
+            else:
+                raise RuntimeError("No active Spark session found")
+        except Exception as e:
+            logger.error(f"Error adding resource: {e}")
+            raise
+    
+    def list(self, resource_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        List resources in state.
+        
+        Args:
+            resource_type: Filter by resource type (optional)
+            
+        Returns:
+            List of state records
+        """
+        where_clause = f"WHERE resource_type = '{resource_type}'" if resource_type else ""
+        query_sql = f"""
+        SELECT internal_id, resource_type, resource_data, created_at 
+        FROM {self.full_table_name} 
+        {where_clause}
+        ORDER BY created_at DESC
+        """
+        
+        try:
+            from pyspark.sql import SparkSession
+            spark = SparkSession.getActiveSession()
+            if spark:
+                df = spark.sql(query_sql)
+                results = []
+                for row in df.collect():
+                    results.append({
+                        'internal_id': row['internal_id'],
+                        'resource_type': row['resource_type'],
+                        'resource_data': json.loads(row['resource_data']),
+                        'created_at': row['created_at']
+                    })
+                return results
+            else:
+                raise RuntimeError("No active Spark session found")
+        except Exception as e:
+            logger.error(f"Error listing resources: {e}")
+            raise
+    
+    def remove(self, internal_id: str) -> bool:
+        """
+        Remove a resource from state by internal ID.
+        
+        Args:
+            internal_id: The internal UUID of the resource
+            
+        Returns:
+            True if removed, False if not found
+        """
+        delete_sql = f"""
+        DELETE FROM {self.full_table_name} 
+        WHERE internal_id = '{internal_id}'
+        """
+        
+        try:
+            from pyspark.sql import SparkSession
+            spark = SparkSession.getActiveSession()
+            if spark:
+                # Check if exists first
+                exists_df = spark.sql(f"SELECT 1 FROM {self.full_table_name} WHERE internal_id = '{internal_id}'")
+                if exists_df.count() == 0:
+                    logger.warning(f"Resource with ID {internal_id} not found")
+                    return False
+                
+                spark.sql(delete_sql)
+                logger.info(f"Removed resource with ID {internal_id}")
+                return True
+            else:
+                raise RuntimeError("No active Spark session found")
+        except Exception as e:
+            logger.error(f"Error removing resource: {e}")
+            raise
+    
+    def clear_all(self, dry_run: bool = False) -> Dict[str, Dict[str, List[Dict[str, str]]]]:
+        """
+        Remove all resources from Databricks and clear state.
+        Deletion order: experiments → jobs → pipelines → multi_agent_supervisors → knowledge_assistants → genie_spaces → endpoints → vector_search_indexes → vector_search_endpoints → apps → warehouses → databasecatalogs → catalogs → postgres_projects → databaseinstances
+        
+        Args:
+            dry_run: If True, only show what would be deleted without actually deleting
+            
+        Returns:
+            Dict with structure: {
+                "resource_type": {
+                    "successful": [{"id": "internal_id", "name": "resource_name"}],
+                    "failed": [{"id": "internal_id", "name": "resource_name", "reason": "error_message"}]
+                }
+            }
+        """
+        # postgres_projects (Lakebase Autoscale) goes after apps so any app consuming
+        # a Lakebase endpoint is removed first, and adjacent to databaseinstances
+        # (legacy Lakebase Provisioned) for logical grouping.
+        # autoscale_synced_tables (Postgres synced tables created via
+        # `utils/lakebase_autoscale.py`) MUST be deleted before postgres_projects,
+        # otherwise the parent-project delete cascades and orphans the synced-table
+        # UC entries, which then fail their own UC drop on the catalog cascade.
+        deletion_order = ['experiments', 'jobs', 'pipelines', 'multi_agent_supervisors', 'knowledge_assistants', 'genie_spaces', 'endpoints', 'vector_search_indexes', 'vector_search_endpoints', 'apps', 'warehouses', 'databasecatalogs', 'model_services', 'catalogs', 'autoscale_synced_tables', 'postgres_projects', 'databaseinstances']
+        results = {}
+        
+        for resource_type in deletion_order:
+            results[resource_type] = {"successful": [], "failed": []}
+            
+            try:
+                resources = self.list(resource_type)
+            except Exception as e:
+                logger.error(f"Error listing {resource_type}: {e}")
+                results[resource_type]["failed"].append({
+                    "id": "N/A", 
+                    "name": "N/A", 
+                    "reason": f"Failed to list {resource_type}: {str(e)}"
+                })
+                continue
+            
+            for resource in resources:
+                resource_data = resource['resource_data']
+                internal_id = resource['internal_id']
+                
+                # Extract resource name for better reporting
+                resource_name = "Unknown"
+                if resource_type == 'experiments':
+                    resource_name = resource_data.get('name', 'Unknown')
+                elif resource_type == 'jobs':
+                    resource_name = resource_data.get('settings', {}).get('name') or resource_data.get('job_id', 'Unknown')
+                elif resource_type == 'pipelines':
+                    resource_name = resource_data.get('name') or resource_data.get('pipeline_id', 'Unknown')
+                elif resource_type == 'endpoints':
+                    resource_name = resource_data.get('endpoint_name', 'Unknown')
+                elif resource_type == 'apps':
+                    resource_name = resource_data.get('name', 'Unknown')
+                elif resource_type == 'warehouses':
+                    resource_name = resource_data.get('name') or resource_data.get('id', 'Unknown')
+                elif resource_type == 'databaseinstances':
+                    resource_name = resource_data.get('name', 'Unknown')
+                elif resource_type == 'postgres_projects':
+                    resource_name = resource_data.get('name') or resource_data.get('project_id', 'Unknown')
+                elif resource_type == 'autoscale_synced_tables':
+                    resource_name = resource_data.get('synced_table_name') or resource_data.get('name', 'Unknown')
+                elif resource_type == 'model_services':
+                    resource_name = resource_data.get('name', 'Unknown') if isinstance(resource_data, dict) else str(resource_data)
+                elif resource_type == 'databasecatalogs':
+                    resource_name = resource_data if isinstance(resource_data, str) else resource_data.get('name', 'Unknown')
+                elif resource_type == 'catalogs':
+                    resource_name = resource_data if isinstance(resource_data, str) else resource_data.get('name', 'Unknown')
+                elif resource_type == 'genie_spaces':
+                    resource_name = resource_data.get('title') or resource_data.get('space_id', 'Unknown')
+                elif resource_type == 'knowledge_assistants':
+                    resource_name = resource_data.get('name') or resource_data.get('agent_id', 'Unknown')
+                elif resource_type == 'multi_agent_supervisors':
+                    resource_name = resource_data.get('name') or resource_data.get('agent_id', 'Unknown')
+                elif resource_type == 'vector_search_indexes':
+                    resource_name = resource_data.get('name', 'Unknown')
+                elif resource_type == 'vector_search_endpoints':
+                    resource_name = resource_data.get('name', 'Unknown')
+                
+                if dry_run:
+                    results[resource_type]["successful"].append({
+                        "id": internal_id, 
+                        "name": resource_name
+                    })
+                    continue
+                
+                # Attempt to delete the resource from Databricks
+                deletion_successful = False
+                error_message = None
+
+                try:
+                    if resource_type == 'experiments':
+                        experiment_id = resource_data.get('experiment_id')
+                        if experiment_id:
+                            import mlflow
+                            client = mlflow.MlflowClient()
+                            client.delete_experiment(experiment_id)
+                            logger.info(f"Deleted experiment {experiment_id}")
+                            deletion_successful = True
+                        else:
+                            error_message = "No experiment_id found in resource data"
+
+                    elif resource_type == 'jobs':
+                        job_id = resource_data.get('job_id')
+                        if job_id:
+                            self.w.jobs.delete(job_id=int(job_id))
+                            logger.info(f"Deleted job {job_id}")
+                            deletion_successful = True
+                        else:
+                            error_message = "No job_id found in resource data"
+                    
+                    elif resource_type == 'pipelines':
+                        pipeline_id = resource_data.get('pipeline_id')
+                        if pipeline_id:
+                            self.w.pipelines.delete(pipeline_id=pipeline_id)
+                            logger.info(f"Deleted pipeline {pipeline_id}")
+                            deletion_successful = True
+                        else:
+                            error_message = "No pipeline_id found in resource data"
+                    
+                    elif resource_type == 'endpoints':
+                        agent_id = resource_data.get('agent_id')
+                        endpoint_name = resource_data.get('endpoint_name')
+                        if agent_id:
+                            # Try v2.1 KA first (current), then v2.0 KA (legacy, in case the
+                            # resource was created by an older deploy), then MAS.
+                            for api_path in [
+                                "/api/2.1/knowledge-assistants",
+                                "/api/2.0/knowledge-assistants",
+                                "/api/2.0/multi-agent-supervisors",
+                            ]:
+                                try:
+                                    self.w.api_client.do("DELETE", f"{api_path}/{agent_id}")
+                                    logger.info(f"Deleted agent {agent_id} via {api_path}")
+                                    deletion_successful = True
+                                    break
+                                except Exception:
+                                    pass
+                            if not deletion_successful and endpoint_name:
+                                try:
+                                    from mlflow.deployments import get_deploy_client
+                                    client = get_deploy_client("databricks")
+                                    client.delete_endpoint(endpoint=endpoint_name)
+                                    logger.info(f"Deleted serving endpoint {endpoint_name}")
+                                    deletion_successful = True
+                                except Exception as ep_err:
+                                    error_message = f"Agent API and endpoint delete both failed: {ep_err}"
+                        elif endpoint_name:
+                            from mlflow.deployments import get_deploy_client
+                            client = get_deploy_client("databricks")
+                            client.delete_endpoint(endpoint=endpoint_name)
+                            logger.info(f"Deleted serving endpoint {endpoint_name}")
+                            deletion_successful = True
+                        else:
+                            error_message = "No endpoint name or agent_id found in resource data"
+                    
+                    elif resource_type in ('knowledge_assistants', 'multi_agent_supervisors'):
+                        tile_id = resource_data.get('tile_id')
+                        agent_id = resource_data.get('agent_id')
+                        agent_name = resource_data.get('name')
+                        # For KAs, prefer the typed v2.1 delete endpoint (DELETE /api/2.1/knowledge-assistants/{id});
+                        # for MAS, the typed endpoint is still v2.0. Fall back to the Tiles API in both cases
+                        # for legacy resources that may not be reachable through the typed paths.
+                        if resource_type == 'knowledge_assistants':
+                            typed_paths = ["/api/2.1/knowledge-assistants", "/api/2.0/knowledge-assistants"]
+                        else:
+                            typed_paths = ["/api/2.0/multi-agent-supervisors"]
+                        for ref in [tile_id, agent_id]:
+                            if ref and not deletion_successful:
+                                for typed_path in typed_paths:
+                                    try:
+                                        self.w.api_client.do("DELETE", f"{typed_path}/{ref}")
+                                        logger.info(f"Deleted {resource_type} {ref} via {typed_path}")
+                                        deletion_successful = True
+                                        break
+                                    except Exception:
+                                        pass
+                        for ref in [tile_id, agent_id, agent_name]:
+                            if ref and not deletion_successful:
+                                try:
+                                    self.w.api_client.do("DELETE", f"/api/2.0/tiles/{ref}")
+                                    logger.info(f"Deleted {resource_type} {ref} via tiles API")
+                                    deletion_successful = True
+                                except Exception:
+                                    pass
+                        if not deletion_successful:
+                            error_message = f"Could not delete via typed or tiles APIs with tile_id={tile_id}, agent_id={agent_id}, or name={agent_name}"
+                    
+                    elif resource_type == 'model_services':
+                        from ai_gateway import delete_model_service
+                        fqn = resource_data.get('name') if isinstance(resource_data, dict) else resource_data
+                        if fqn:
+                            delete_model_service(self.w, fqn)
+                            logger.info(f"Deleted model service {fqn}")
+                            deletion_successful = True
+                        else:
+                            error_message = "No model service name found in resource data"
+
+                    elif resource_type == 'apps':
+                        app_name = resource_data.get('name')
+                        if app_name:
+                            self.w.apps.delete(app_name)
+                            logger.info(f"Deleted app {app_name}")
+                            deletion_successful = True
+                        else:
+                            error_message = "No app name found in resource data"
+                    
+                    elif resource_type == 'warehouses':
+                        warehouse_id = resource_data.get('id')
+                        if warehouse_id:
+                            self.w.warehouses.delete(id=warehouse_id)
+                            logger.info(f"Deleted warehouse {warehouse_id}")
+                            deletion_successful = True
+                        else:
+                            error_message = "No warehouse id found in resource data"
+                    
+                    elif resource_type == 'databaseinstances':
+                        instance_name = resource_data.get('name')
+                        if instance_name:
+                            self.w.database.delete_database_instance(name=instance_name)
+                            logger.info(f"Deleted database instance {instance_name}")
+                            deletion_successful = True
+                        else:
+                            error_message = "No instance name found in resource data"
+
+                    elif resource_type == 'autoscale_synced_tables':
+                        # Lakebase Autoscale synced table created via
+                        # `utils/lakebase_autoscale.create_autoscale_synced_table`.
+                        # Resource data: {synced_table_name: "<catalog>.<schema>.<table>",
+                        #                 project_id: "...", postgres_database: "..."}
+                        # Delete via the helper's DELETE; the UC table entry itself
+                        # disappears with the cascading catalog drop below.
+                        from lakebase_autoscale import delete_autoscale_synced_table  # local import; utils on sys.path
+                        synced_table_name = resource_data.get('synced_table_name') or resource_data.get('name')
+                        if synced_table_name:
+                            try:
+                                deleted = delete_autoscale_synced_table(self.w, synced_table_name)
+                                logger.info(
+                                    f"Autoscale synced table {synced_table_name}: "
+                                    f"{'deleted' if deleted else 'already gone'}"
+                                )
+                                deletion_successful = True
+                            except Exception as e:
+                                error_message = f"delete_autoscale_synced_table({synced_table_name}) failed: {e}"
+                        else:
+                            error_message = "No synced_table_name found in resource data"
+
+                    elif resource_type == 'postgres_projects':
+                        # Lakebase Autoscale project. Resource data is either:
+                        #   {project_id, name="projects/{project_id}"}  (new format from operational_lakebase)
+                        #   {name="projects/{project_id}"}              (older entries)
+                        project_resource_name = resource_data.get('name')
+                        project_id = resource_data.get('project_id')
+                        if not project_resource_name and project_id:
+                            project_resource_name = f"projects/{project_id}"
+                        if project_resource_name:
+                            # delete_project returns a DeleteProjectOperation (no .result());
+                            # purge=True performs a hard delete so the project is fully removed.
+                            self.w.postgres.delete_project(name=project_resource_name, purge=True)
+                            logger.info(f"Deleted Lakebase Autoscale project {project_resource_name}")
+                            deletion_successful = True
+                        else:
+                            error_message = "No project_id or name found in resource data"
+                    
+                    elif resource_type == 'databasecatalogs':
+                        catalog_name = resource_data if isinstance(resource_data, str) else resource_data.get('name')
+                        if catalog_name:
+                            self.w.database.delete_database_catalog(name=catalog_name)
+                            logger.info(f"Deleted database catalog {catalog_name}")
+                            deletion_successful = True
+                        else:
+                            error_message = "No database catalog name found in resource data"
+                    
+                    elif resource_type == 'genie_spaces':
+                        space_id = resource_data.get('space_id')
+                        if space_id:
+                            self.w.api_client.do("DELETE", f"/api/2.0/genie/spaces/{space_id}")
+                            logger.info(f"Deleted Genie space {space_id}")
+                            deletion_successful = True
+                        else:
+                            error_message = "No space_id found in resource data"
+                    
+                    elif resource_type == 'vector_search_indexes':
+                        index_name = resource_data.get('name')
+                        if index_name:
+                            self.w.vector_search_indexes.delete_index(index_name=index_name)
+                            logger.info(f"Deleted vector search index {index_name}")
+                            deletion_successful = True
+                        else:
+                            error_message = "No index name found in resource data"
+                    
+                    elif resource_type == 'vector_search_endpoints':
+                        endpoint_name = resource_data.get('name')
+                        if endpoint_name:
+                            self.w.vector_search_endpoints.delete_endpoint(endpoint_name=endpoint_name)
+                            logger.info(f"Deleted vector search endpoint {endpoint_name}")
+                            deletion_successful = True
+                        else:
+                            error_message = "No endpoint name found in resource data"
+                    
+                    elif resource_type == 'catalogs':
+                        catalog_name = resource_data if isinstance(resource_data, str) else resource_data.get('name')
+                        if catalog_name:
+                            self.w.catalogs.delete(name=catalog_name, force=True)
+                            logger.info(f"Deleted catalog {catalog_name}")
+                            deletion_successful = True
+                        else:
+                            error_message = "No catalog name found in resource data"
+                    
+                except Exception as e:
+                    error_message = str(e)
+                    logger.error(f"Error deleting {resource_type} {resource_name} (ID: {internal_id}): {e}")
+                
+                # Remove from state if deletion was successful
+                if deletion_successful:
+                    try:
+                        self.remove(internal_id)
+                        results[resource_type]["successful"].append({
+                            "id": internal_id, 
+                            "name": resource_name
+                        })
+                    except Exception as e:
+                        logger.error(f"Error removing {internal_id} from state: {e}")
+                        results[resource_type]["failed"].append({
+                            "id": internal_id, 
+                            "name": resource_name, 
+                            "reason": f"Resource deleted but failed to remove from state: {str(e)}"
+                        })
+                else:
+                    results[resource_type]["failed"].append({
+                        "id": internal_id, 
+                        "name": resource_name, 
+                        "reason": error_message or "Unknown deletion error"
+                    })
+        
+        return results
+    
+    def get_resource_by_id(self, internal_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a specific resource by internal ID.
+        
+        Args:
+            internal_id: The internal UUID of the resource
+            
+        Returns:
+            Resource record or None if not found
+        """
+        query_sql = f"""
+        SELECT internal_id, resource_type, resource_data, created_at 
+        FROM {self.full_table_name} 
+        WHERE internal_id = '{internal_id}'
+        """
+        
+        try:
+            from pyspark.sql import SparkSession
+            spark = SparkSession.getActiveSession()
+            if spark:
+                df = spark.sql(query_sql)
+                rows = df.collect()
+                if rows:
+                    row = rows[0]
+                    return {
+                        'internal_id': row['internal_id'],
+                        'resource_type': row['resource_type'],
+                        'resource_data': json.loads(row['resource_data']),
+                        'created_at': row['created_at']
+                    }
+                return None
+            else:
+                raise RuntimeError("No active Spark session found")
+        except Exception as e:
+            logger.error(f"Error getting resource by ID: {e}")
+            raise
+    
+# Convenience function for adding resources without creating state manager explicitly
+def add(catalog: str, resource_type: str, resource_obj: Any, schema: str = "_internal_state", table: str = "resources") -> str:
+    """
+    Add a resource to state without creating state manager explicitly.
+
+    Args:
+        catalog: The catalog name to store state in
+        resource_type: Type of resource (experiments, jobs, pipelines, apps, databaseinstances, endpoints, catalogs, databasecatalogs, warehouses, genie_spaces, vector_search_endpoints, vector_search_indexes)
+        resource_obj: The API return object from Databricks SDK or a dict with resource metadata
+        schema: Schema name (default: _internal_state)
+        table: Table name (default: resources)
+        
+    Returns:
+        internal_id: Generated UUID for this resource
+    """
+    state_manager = UCState(catalog=catalog, schema=schema, table=table)
+    return state_manager.add(resource_type, resource_obj)
+
+
+# Convenience function for easy initialization
+def create_state_manager(catalog: str, schema: str = "_internal_state", table: str = "resources") -> UCState:
+    """
+    Create a UC-State manager instance.
+    
+    Args:
+        catalog: The catalog name to store state in
+        schema: Schema name (default: _caspers_state)
+        table: Table name (default: resources)
+        
+    Returns:
+        UCState instance
+    """
+    return UCState(catalog=catalog, schema=schema, table=table)

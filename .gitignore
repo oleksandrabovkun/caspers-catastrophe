@@ -1,0 +1,12 @@
+.state/
+.DS_Store
+__pycache__/
+.idea/
+.env
+.databricks/
+.claude/
+.cursor/
+.bundle/
+.venv/
+*.pyc
+apps/**/app.yaml
