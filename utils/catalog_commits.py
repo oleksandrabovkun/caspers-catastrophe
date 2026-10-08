@@ -12,6 +12,8 @@ DELTA_PATH_BASED_ACCESS_TO_CATALOG_MANAGED_TABLE_BLOCKED (DLT still path-loads
 those tables). Never enable it on silver_*/gold_*/__materialization* names.
 """
 
+from status import ok, reuse, skip, warn
+
 CATALOG_COMMITS_PROPERTY = "delta.feature.catalogManaged"
 CATALOG_COMMITS_VALUE = "supported"
 
@@ -33,7 +35,8 @@ def _skip_name(name: str) -> bool:
 
 def _already_enabled(spark, table: str) -> bool:
     try:
-        detail = spark.sql(f"DESCRIBE DETAIL {table}").collect()[0]
+        from uc_ident import uc
+        detail = spark.sql(f"DESCRIBE DETAIL {uc(table)}").collect()[0]
     except Exception:
         return False
     features = detail.asDict().get("tableFeatures") or []
@@ -44,16 +47,17 @@ def enable_catalog_commits(spark, *tables: str) -> None:
     """ALTER TABLE … SET TBLPROPERTIES for catalog commits (idempotent per table)."""
     for table in tables:
         if _already_enabled(spark, table):
-            print(f"  {table}: catalog commits already enabled")
+            reuse(f"{table}: catalog commits already enabled")
             continue
         try:
+            from uc_ident import uc
             spark.sql(
-                f"ALTER TABLE {table} SET TBLPROPERTIES "
+                f"ALTER TABLE {uc(table)} SET TBLPROPERTIES "
                 f"('{CATALOG_COMMITS_PROPERTY}' = '{CATALOG_COMMITS_VALUE}')"
             )
-            print(f"  ✅ {table}: catalog commits enabled")
+            ok(f"{table}: catalog commits enabled")
         except Exception as exc:
-            print(f"  ⚠️  {table}: could not enable catalog commits — {exc}")
+            warn(f"{table}: could not enable catalog commits — {exc}")
 
 
 def enable_catalog_commits_in_schema(spark, catalog: str, schema: str) -> None:
@@ -74,10 +78,10 @@ def enable_catalog_commits_in_schema(spark, catalog: str, schema: str) -> None:
         name = row.table_name
         ttype = str(row.table_type or "").upper()
         if _skip_name(name):
-            print(f"  skip {catalog}.{schema}.{name} (dlt/pipeline output)")
+            skip(f"{catalog}.{schema}.{name} (dlt/pipeline output)")
             continue
         if ttype not in _ALTERABLE_TYPES:
-            print(f"  skip {catalog}.{schema}.{name} ({ttype.lower()})")
+            skip(f"{catalog}.{schema}.{name} ({ttype.lower()})")
             continue
         tables.append(f"`{catalog}`.`{schema}`.`{name}`")
     enable_catalog_commits(spark, *tables)

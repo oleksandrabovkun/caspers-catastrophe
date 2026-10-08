@@ -403,7 +403,7 @@ class Agent:
                 from_user = _ingredient_from_text(user_text)
                 ingredient = _norm_ingredient(from_user) if from_user else DEFAULT_INGREDIENT
             sql = sql.replace("{ingredient}", ingredient)
-        sql = sql.replace("{catalog}", self._catalog)
+        sql = sql.replace("{catalog}", f"`{self._catalog}`")
         log.info(
             "Agent action %s backend=%s%s",
             query_id,

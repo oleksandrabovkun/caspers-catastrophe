@@ -4,7 +4,7 @@ bundle:
 
 variables:
   catalog:
-    description: "UC catalog for this bundle/target"
+    description: "UC catalog. Deploy: --var catalog=<name>. Cleanup script: BUNDLE_VAR_catalog=<name> (bundle run does not take --var)."
     default: devconnect
 
 workspace:
@@ -31,29 +31,16 @@ sync:
 
 scripts:
   cleanup:
-    # Cleanup is a bundle SCRIPT (not a job task). Catalog override:
-    #   BUNDLE_VAR_catalog=mycatalog databricks bundle run cleanup
-    # `--params CATALOG=...` is ignored by scripts.
+    # Scripts ignore --var and --params. Override catalog with:
+    #   BUNDLE_VAR_catalog=<name> databricks bundle run cleanup
+    # (${var.*} cannot go in content; resolve it here and pass as $CATALOG.)
+    env:
+      CATALOG: ${var.catalog}
+      FILE_PATH: ${workspace.file_path}
     content: |
       set -eo pipefail
 
-      TARGET_FLAG=""
-      if [ -n "$DATABRICKS_BUNDLE_TARGET" ]; then
-        TARGET_FLAG="-t $DATABRICKS_BUNDLE_TARGET"
-      fi
-
-      VAR_FLAG=""
-      if [ -n "$BUNDLE_VAR_catalog" ]; then
-        VAR_FLAG="--var catalog=$BUNDLE_VAR_catalog"
-      fi
-
-      RESOLVED_JSON="$(databricks bundle validate $TARGET_FLAG $VAR_FLAG --output json)"
-
-      FILE_PATH="$(printf '%s' "$RESOLVED_JSON" | jq -r '.workspace.file_path // (.workspace.root_path + "/src")')"
-      CATALOG="$(printf '%s' "$RESOLVED_JSON" | jq -r '.variables.catalog.value // .variables.catalog.default')"
-
       echo "Cleaning up catalog: $CATALOG"
-      echo "  (override with: BUNDLE_VAR_catalog=<name> databricks bundle run cleanup)"
 
       mkdir -p .bundle
       cat > .bundle/submit.json <<JSON
@@ -82,8 +69,8 @@ targets:
         default: devconnect
     resources:
       sql_warehouses:
-        caspers_devconnect_ops_warehouse:
-          name: ${var.catalog}-devconnect-ops
+        ops_warehouse:
+          name: ${var.catalog}-ops
           cluster_size: 2X-Small
           min_num_clusters: 1
           max_num_clusters: 1
@@ -94,7 +81,7 @@ targets:
         catastrophe_command_center:
           display_name: "Delivery Catastrophe Command Center (${var.catalog})"
           file_path: ./resources/dashboards/catastrophe_command_center.lvdash.json
-          warehouse_id: ${resources.sql_warehouses.caspers_devconnect_ops_warehouse.id}
+          warehouse_id: ${resources.sql_warehouses.ops_warehouse.id}
           dataset_catalog: ${var.catalog}
       jobs:
         caspers:
@@ -103,13 +90,16 @@ targets:
             enabled: true
           performance_target: PERFORMANCE_OPTIMIZED
 
+          # CATALOG / warehouse name default from ${var.catalog}. Do not also
+          # set notebook base_parameters — DAB forbids mixing those with job
+          # parameters. Notebooks inherit these as widgets.
           parameters:
             - name: CATALOG
               default: ${var.catalog}
             - name: SIMULATOR_SCHEMA
               default: metadata
             - name: OPS_WAREHOUSE_NAME
-              default: ${var.catalog}-devconnect-ops
+              default: ${var.catalog}-ops
             - name: AI_GATEWAY_ENDPOINT_NAME
               default: ""
               # Empty => {catalog}.default.command-agent, created by Catastrophe_Command.

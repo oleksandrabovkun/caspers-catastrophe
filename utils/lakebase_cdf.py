@@ -21,6 +21,8 @@ from typing import Any
 
 from databricks.sdk import WorkspaceClient
 
+from status import info, ok, reuse, warn
+
 # Resource path uses hyphenated database_id (databricks-postgres); Postgres
 # database name is databricks_postgres (underscore).
 DEFAULT_DATABASE_ID = "databricks-postgres"
@@ -135,13 +137,13 @@ def enable_cdf(
             match.get("catalog") == catalog and match.get("schema") == schema
         )
         if same_dest:
-            print(
+            reuse(
                 f"CDF already enabled: {postgres_schema} → {catalog}.{schema} "
                 f"({match.get('name')})"
             )
             return match
         old_id = match.get("cdf_config_id") or match.get("name", "").rsplit("/", 1)[-1]
-        print(
+        warn(
             f"CDF for '{postgres_schema}' points at "
             f"{match.get('catalog')}.{match.get('schema')}; "
             f"retargeting to {catalog}.{schema}"
@@ -169,7 +171,7 @@ def enable_cdf(
     created = _wait_operation(
         w, op, label=f"create CDF config → {catalog}.{schema}"
     )
-    print(
+    ok(
         f"CDF enabled: {postgres_schema} → {catalog}.{schema} "
         f"({created.get('name') or 'ok'})"
     )
@@ -188,12 +190,13 @@ def wait_for_cdf_table(
     last_err: Exception | None = None
     while time.time() < deadline:
         try:
-            spark.table(full_table_name).limit(0).collect()
-            print(f"CDF table ready: {full_table_name}")
+            from uc_ident import uc
+            spark.table(uc(full_table_name)).limit(0).collect()
+            ok(f"CDF table ready: {full_table_name}")
             return
         except Exception as exc:
             last_err = exc
-            print(f"Waiting for {full_table_name}: {exc}")
+            info(f"Waiting for {full_table_name}: {exc}")
             time.sleep(poll_s)
     raise TimeoutError(
         f"Timed out waiting for {full_table_name}"

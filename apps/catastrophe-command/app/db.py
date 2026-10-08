@@ -469,9 +469,9 @@ def _ensure_schema() -> None:
 
 
 def _seed_city_crossings() -> None:
-    from .city_crossings import CROSSINGS
+    from .catastrophe_scenarios import crossing_rows
 
-    for city_id, bridge_name, alt_name, river in CROSSINGS:
+    for city_id, bridge_name, alt_name, river in crossing_rows():
         _exec(
             """
             INSERT INTO city_crossings (city_id, bridge_name, alt_name, river)

@@ -3,7 +3,7 @@
 Speaker notes for Casper's Catastrophe Command. SQL to paste is in this
 folder. Architecture sketch: `Architecture.png` (if present).
 
-Set the city in the app config screen. Ops warehouse: `{catalog}-devconnect-ops`.
+Set the city in the app config screen. Ops warehouse: `{catalog}-ops`.
 
 ## Demo 1: Survive
 
@@ -20,7 +20,7 @@ Set the city in the app config screen. Ops warehouse: `{catalog}-devconnect-ops`
 
 3. In Lakebase, run **`1-lakebase-reroute-orders.sql`** (once), let complaints stack up, then run **`2-lakebase-issue-fair-refund.sql`**. Explain Lakebase.
 
-4. In the `{catalog}-devconnect-ops` warehouse, run **`3-warehouse-estimate-revenue-at-risk.sql`**, then **`4-warehouse-compare-today-vs-normal.sql`**. Find-replace `devconnect` if that is not your catalog. These read Lakebase CDF (`lb_orders_history`) and `orders.bronze_hist_orders` through UC, read-only. Explain LTAP.
+4. In the `{catalog}-ops` warehouse, run **`3-warehouse-estimate-revenue-at-risk.sql`**, then **`4-warehouse-compare-today-vs-normal.sql`**. Put your catalog in `USE CATALOG IDENTIFIER('your_catalog')` at the top of each file. These read Lakebase CDF (`lb_orders_history`) and `orders.bronze_hist_orders` through UC, read-only. Explain LTAP.
 
 5. Kitchen supply is stuck because of the collapse. Update the menu from inventory with a transaction: run **`5-warehouse-transactions-remove-menu-items.sql`** in the same warehouse (blocks 5a → 5 → 5b). Explain managed tables and transactions.
 

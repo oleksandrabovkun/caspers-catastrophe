@@ -28,6 +28,8 @@ class UCState:
         self.schema = schema
         self.table = table
         self.full_table_name = f"{catalog}.{schema}.{table}"
+        from uc_ident import uc
+        self.sql_table_name = uc(catalog, schema, table)
         # Lazy-import the SDK so `from uc_state import add` doesn't pay the
         # WorkspaceClient discovery cost in notebooks that only import the
         # module (e.g. for type hints or convenience functions) without ever
@@ -70,7 +72,7 @@ class UCState:
     def _create_table_if_not_exists(self):
         """Create the state table if it doesn't exist."""
         create_table_sql = f"""
-        CREATE TABLE IF NOT EXISTS {self.full_table_name} (
+        CREATE TABLE IF NOT EXISTS {self.sql_table_name} (
             internal_id STRING NOT NULL,
             resource_type STRING NOT NULL,
             resource_data STRING NOT NULL,
@@ -123,7 +125,7 @@ class UCState:
         resource_data = resource_data.replace("'", "''")
 
         insert_sql = f"""
-        INSERT INTO {self.full_table_name} 
+        INSERT INTO {self.sql_table_name} 
         (internal_id, resource_type, resource_data, created_at)
         VALUES ('{internal_id}', '{resource_type}', '{resource_data}', CURRENT_TIMESTAMP())
         """
@@ -154,7 +156,7 @@ class UCState:
         where_clause = f"WHERE resource_type = '{resource_type}'" if resource_type else ""
         query_sql = f"""
         SELECT internal_id, resource_type, resource_data, created_at 
-        FROM {self.full_table_name} 
+        FROM {self.sql_table_name} 
         {where_clause}
         ORDER BY created_at DESC
         """
@@ -190,7 +192,7 @@ class UCState:
             True if removed, False if not found
         """
         delete_sql = f"""
-        DELETE FROM {self.full_table_name} 
+        DELETE FROM {self.sql_table_name} 
         WHERE internal_id = '{internal_id}'
         """
         
@@ -199,7 +201,7 @@ class UCState:
             spark = SparkSession.getActiveSession()
             if spark:
                 # Check if exists first
-                exists_df = spark.sql(f"SELECT 1 FROM {self.full_table_name} WHERE internal_id = '{internal_id}'")
+                exists_df = spark.sql(f"SELECT 1 FROM {self.sql_table_name} WHERE internal_id = '{internal_id}'")
                 if exists_df.count() == 0:
                     logger.warning(f"Resource with ID {internal_id} not found")
                     return False
@@ -215,8 +217,10 @@ class UCState:
     
     def clear_all(self, dry_run: bool = False) -> Dict[str, Dict[str, List[Dict[str, str]]]]:
         """
-        Remove all resources from Databricks and clear state.
-        Deletion order: experiments → jobs → pipelines → multi_agent_supervisors → knowledge_assistants → genie_spaces → endpoints → vector_search_indexes → vector_search_endpoints → apps → warehouses → databasecatalogs → catalogs → postgres_projects → databaseinstances
+        Remove tracked resources from Databricks and clear state.
+        Does not drop Unity Catalog catalogs (this demo requires the catalog
+        to already exist; cleanup only removes demo schemas and runtime objects).
+        Deletion order: experiments → jobs → pipelines → multi_agent_supervisors → knowledge_assistants → genie_spaces → endpoints → vector_search_indexes → vector_search_endpoints → apps → warehouses → databasecatalogs → postgres_projects → databaseinstances
         
         Args:
             dry_run: If True, only show what would be deleted without actually deleting
@@ -235,8 +239,10 @@ class UCState:
         # autoscale_synced_tables (Postgres synced tables created via
         # `utils/lakebase_autoscale.py`) MUST be deleted before postgres_projects,
         # otherwise the parent-project delete cascades and orphans the synced-table
-        # UC entries, which then fail their own UC drop on the catalog cascade.
-        deletion_order = ['experiments', 'jobs', 'pipelines', 'multi_agent_supervisors', 'knowledge_assistants', 'genie_spaces', 'endpoints', 'vector_search_indexes', 'vector_search_endpoints', 'apps', 'warehouses', 'databasecatalogs', 'model_services', 'catalogs', 'autoscale_synced_tables', 'postgres_projects', 'databaseinstances']
+        # UC entries, which then fail their own UC drop when demo schemas go.
+        # Never delete `catalogs` here — the catalog is a pre-existing workspace
+        # object and may be shared with other demos.
+        deletion_order = ['experiments', 'jobs', 'pipelines', 'multi_agent_supervisors', 'knowledge_assistants', 'genie_spaces', 'endpoints', 'vector_search_indexes', 'vector_search_endpoints', 'apps', 'warehouses', 'databasecatalogs', 'model_services', 'autoscale_synced_tables', 'postgres_projects', 'databaseinstances']
         results = {}
         
         for resource_type in deletion_order:
@@ -445,8 +451,8 @@ class UCState:
                         # `utils/lakebase_autoscale.create_autoscale_synced_table`.
                         # Resource data: {synced_table_name: "<catalog>.<schema>.<table>",
                         #                 project_id: "...", postgres_database: "..."}
-                        # Delete via the helper's DELETE; the UC table entry itself
-                        # disappears with the cascading catalog drop below.
+                        # Delete via the helper's DELETE; leftover UC table names
+                        # are dropped with the demo schemas in destroy.ipynb.
                         from lakebase_autoscale import delete_autoscale_synced_table  # local import; utils on sys.path
                         synced_table_name = resource_data.get('synced_table_name') or resource_data.get('name')
                         if synced_table_name:
@@ -517,12 +523,9 @@ class UCState:
                     
                     elif resource_type == 'catalogs':
                         catalog_name = resource_data if isinstance(resource_data, str) else resource_data.get('name')
-                        if catalog_name:
-                            self.w.catalogs.delete(name=catalog_name, force=True)
-                            logger.info(f"Deleted catalog {catalog_name}")
-                            deletion_successful = True
-                        else:
-                            error_message = "No catalog name found in resource data"
+                        error_message = (
+                            f"Skipping catalog {catalog_name!r}: cleanup does not drop catalogs"
+                        )
                     
                 except Exception as e:
                     error_message = str(e)
@@ -564,7 +567,7 @@ class UCState:
         """
         query_sql = f"""
         SELECT internal_id, resource_type, resource_data, created_at 
-        FROM {self.full_table_name} 
+        FROM {self.sql_table_name} 
         WHERE internal_id = '{internal_id}'
         """
         

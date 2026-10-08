@@ -35,9 +35,9 @@ just_jobs = state.list("jobs")
 # Remove specific resource
 state.remove(job_id)
 
-# Clear everything (dry run first!)
+# Clear tracked runtime resources (dry run first!). Does not drop catalogs.
 preview = state.clear_all(dry_run=True)
-state.clear_all()  # Actually delete everything
+state.clear_all()
 ```
 
 ## Configuration
@@ -73,4 +73,4 @@ Supported resource types and their cleanup methods:
 - `models` → `mlflow.deployments.delete_endpoint(name)`
 - `apps` → `w.apps.delete(name)`
 - `databaseinstances` → `w.database.delete_database_instance(name)`
-- `catalogs` → `w.catalogs.delete(name, force=True)`
+- `catalogs` — tracked only; `clear_all()` does **not** drop catalogs (this demo keeps the pre-existing UC catalog)

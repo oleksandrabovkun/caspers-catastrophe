@@ -1,7 +1,7 @@
 -- 3-warehouse-estimate-revenue-at-risk
--- Catalog: find-replace `devconnect` if you deployed with another catalog name.
--- Or run once: USE CATALOG IDENTIFIER('your_catalog');
+-- Replace your_catalog with the catalog you deployed.
 --
+
 -- Estimates revenue still at risk in the current demo run: open live orders
 -- (from Lakebase CDF → lakebase.lb_orders_history) valued with
 -- this city's historical average order value from orders.bronze_hist_orders.
@@ -9,15 +9,17 @@
 --
 -- Requires: Lakebase CDF into lb_orders_history (initializer: Catastrophe_Command).
 
+USE CATALOG IDENTIFIER('your_catalog');
+
 WITH active AS (
-    SELECT city_id FROM devconnect.metadata.demo_active_city WHERE id = 1
+    SELECT city_id FROM metadata.demo_active_city WHERE id = 1
 ),
 live_orders AS (
     SELECT order_id, session_id, city, status, kind, late_min, updated_at
     FROM (
         SELECT *,
                ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY _sort_by DESC) AS rn
-        FROM devconnect.lakebase.lb_orders_history
+        FROM lakebase.lb_orders_history
     ) o
     WHERE rn = 1
       AND _pg_change_type IN ('insert', 'update_postimage')
@@ -36,7 +38,7 @@ latest AS (
 ),
 hist_val AS (
     SELECT city_id, kind, ROUND(AVG(order_value), 2) AS avg_order_value
-    FROM devconnect.orders.bronze_hist_orders
+    FROM orders.bronze_hist_orders
     GROUP BY city_id, kind
 ),
 live_open AS (

@@ -1,7 +1,7 @@
 -- 4-warehouse-compare-today-vs-normal
--- Catalog: find-replace `devconnect` if you deployed with another catalog name.
--- Or run once: USE CATALOG IDENTIFIER('your_catalog');
+-- Replace your_catalog with the catalog you deployed.
 --
+
 -- Compares this demo run against a normal day for the active city:
 -- cancel %, disrupted % (stuck/rerouted), and average lateness. Live side
 -- comes from Lakebase CDF (lb_orders_history); baseline from
@@ -9,15 +9,17 @@
 --
 -- Requires: Lakebase CDF into lb_orders_history (initializer: Catastrophe_Command).
 
+USE CATALOG IDENTIFIER('your_catalog');
+
 WITH active AS (
-    SELECT city_id FROM devconnect.metadata.demo_active_city WHERE id = 1
+    SELECT city_id FROM metadata.demo_active_city WHERE id = 1
 ),
 live_orders AS (
     SELECT order_id, session_id, city, status, kind, late_min, updated_at
     FROM (
         SELECT *,
                ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY _sort_by DESC) AS rn
-        FROM devconnect.lakebase.lb_orders_history
+        FROM lakebase.lb_orders_history
     ) o
     WHERE rn = 1
       AND _pg_change_type IN ('insert', 'update_postimage')
@@ -48,7 +50,7 @@ hist AS (
         ROUND(100.0 * AVG(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 1) AS cancel_pct,
         ROUND(100.0 * AVG(CASE WHEN disrupted THEN 1 ELSE 0 END), 1) AS disrupted_pct,
         ROUND(AVG(late_min), 1) AS avg_late_min
-    FROM devconnect.orders.bronze_hist_orders h
+    FROM orders.bronze_hist_orders h
     JOIN latest l ON h.city_id = l.city
 )
 SELECT 'today (this run)' AS period, l.orders, l.cancel_pct, l.disrupted_pct, l.avg_late_min FROM live l
