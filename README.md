@@ -1,10 +1,12 @@
 # Casper's Catastrophe Command
 
+A Databricks **demo** you deploy in your own workspace.
+
 The bridge is closed. Frozen orders are melting. Complaints are stacking.
 
 **You have minutes, not a ticket to data engineering.**
 
-This is a Databricks app you deploy in your workspace: a live delivery map, Lakebase for the writes, a lakehouse that still answers questions while ops is on fire, and an agent that only runs SQL someone already vetted.
+Live delivery map, Lakebase for the writes, a lakehouse that still answers questions while ops is on fire, and an agent that only runs SQL someone already vetted.
 
 ```
 Open the app → pick a city → start the outage.
